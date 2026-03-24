@@ -1,0 +1,11 @@
+__pycache__/
+**/__pycache__
+**/**/__pycache__
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+
+# Local outputs
+runtime_profile*/
+examples/_runtime_profile_toys/
