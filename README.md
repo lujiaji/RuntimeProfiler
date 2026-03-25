@@ -1,40 +1,77 @@
 # Runtime Profiler
 
-Lightweight, model-agnostic runtime profiler for GPU bottleneck analysis.
+面向**瓶颈归因**的个人分析工具：在线轻量总览 + 可选离线精剖（Nsight Compute / CUPTI 预留），统一输出「运行时间主要被什么资源限制」的结论与证据链。
 
-It helps answer:
-- Is the workload `compute_bound` or `memory_bound`?
-- What are peak memory / bandwidth-proxy metrics?
-- Which internal function was active when the peak happened?
+## 目标与结论标签
 
-The core API is function-based:
+最终问题不是「显存高不高」，而是**时间主要被谁限制**。标签包括：
+
+- `compute_bound` — SM / Tensor / FP / INT 等算力管线成为主矛盾  
+- `memory_bound` — **设备端** DRAM（HBM/GDDR）带宽或相关压力为主（需 measured DRAM 或离线 kernel 证据才有高置信度）  
+- `pcie_io_bound` — **主机–设备** PCIe 搬运（H2D/D2H、paging、CPU KV 等）与运行时间强相关  
+- `mixed_bound` — 不同阶段或多种资源同时显著  
+- `latency_bound` — 利用率整体不高但耗时长：同步空洞、kernel 过碎、stall、occupancy 过低等  
+
+### 三类资源域（必须区分）
+
+| 域 | 含义 |
+|----|------|
+| **Compute** | SM / Tensor Core / FP / INT |
+| **Device memory** | 片上 HBM/GDDR 带宽与设备内存子系统（不是 PCIe） |
+| **Host–device IO** | PCIe（后续可扩展 NVLink） |
+
+### 术语与常见误区
+
+1. **PCIe 吞吐 ≠ 设备 DRAM 带宽**：前者是 CPU↔GPU 链路，后者是 GPU 上 HBM/GDDR。  
+2. **`dram_bw_proxy_gbps`**：由 legacy NVML 等推导的近似，**不是**硬件实测 DRAM 吞吐。  
+3. **高置信度 `memory_bound`**：需要 NVML GPM 的 DRAM BW 类指标，或 Nsight Compute / CUPTI 的 kernel 级证据。  
+4. **高置信度 `compute_bound`**：需要 SM/Tensor/管线利用率或离线 throughput 指标支撑。  
+5. **「显存占用高」**：多为 **capacity / residency**（容量压力），**不等于** `memory_bound`（吞吐/访存受限）。  
+6. **KV cache / attention 类问题**：同时看 **DRAM BW**（片上供给）、**PCIe**（与 CPU 间搬运）、**SM/Tensor/occupancy**（是否算力吃满）。
+
+## Python API
 
 ```python
 from runtime_profiler import RuntimeProfiler, RuntimeProfilerConfig
 
 profiler = RuntimeProfiler(
-    RuntimeProfilerConfig(output_dir="./runtime_profile", sample_interval_ms=20)
+    RuntimeProfilerConfig(
+        output_dir="./runtime_profile",
+        sample_interval_ms=20,
+        backend_preference=["nvml_gpm", "nvml_legacy", "torch_cuda"],
+        detail_plot_mode=False,
+    )
 )
 result = profiler.run(target_fn, *args, **kwargs)
-print(result.summary["bound_classification"])
+print(result.summary["classification"])
+print(result.summary["merged_diagnosis_preview"])
 ```
 
-## Features
+- `backend_preference` 默认优先 **NVML GPM + legacy 补齐**；`nvml` 等价于 `nvml_legacy`。  
+- `classification`：`label`, `confidence`, `primary_evidence`, `secondary_evidence`, `metric_coverage`, `limitations` 等。  
+- `bound_classification`：兼容旧字段（内含 `structured` 全量分类）。  
+- 可选离线 NCU：`RuntimeProfilerConfig(ncu={"enabled": True, "target_python_entry": "...", ...})`（会单独跑 `ncu`，耗时长）。
 
-- Model-agnostic profiling via `profiler.run(target_fn, *args, **kwargs)`
-- Time-series GPU sampling (NVML first, Torch CUDA fallback)
-- Runtime bandwidth sampling (`bandwidth_total/tx/rx` from NVML PCIe throughput; fallback keeps total only via memory-bandwidth proxy)
-- Function-level event tracing (`trace` context manager and decorator)
-- Peak attribution (maps peak timestamps to innermost active function)
-- Bound classification (`compute_bound` / `memory_bound` / `mixed_bound`)
-- Optional `torch.profiler` export for op-level CUDA time / memory statistics
-- Export to CSV/JSON and timeline plots
+## 输出文件
 
-## Quick Start
+| 文件 | 说明 |
+|------|------|
+| `profile_samples.csv` | 在线采样（含时间窗、活跃 event、各域指标、source_*） |
+| `profile_events.json` | 带 `metrics_rollup` 与 `event_classification` 的 trace 事件 |
+| `profile_event_summary.csv` | 按事件的 duration / avg / p95 / max 聚合 |
+| `profile_summary.json` | 全局分类、top 事件列表、能力声明等 |
+| `profile_main_figure.png` | **六面板**主诊断图（时间轴对齐） |
+| `profile_event_bars.png` | 事件时长 + 平均 sm / dram_bw / pcie |
+| `profile_event_heatmap.png` | 事件 × 指标归一化热力图 |
+| `profile_events_timeline.png` | 事件甘特（legacy 单列图） |
+| `merged_diagnosis_report.json` | 在线 + 离线合并预览 |
+| `kernel_level_metrics.csv/json` | 离线 NCU 解析结果（若存在） |
+| `kernel_bound_summary.json` | 离线 kernel 级粗结论 |
+| `kernel_drilldown.png` | 离线 kernel 条形图（若有 kernel 摘要） |
 
-### 1) Generic CLI (recommended)
+主图六面板：**事件时间线** | **Compute** | **Device memory 压力** | **Capacity/显存占用** | **PCIe** | **功耗/频率/温度**。
 
-Use the reusable script for any project by passing a module + function:
+## 通用 CLI
 
 ```bash
 python runtime_profiler/scripts/profile_any_model.py \
@@ -44,125 +81,47 @@ python runtime_profiler/scripts/profile_any_model.py \
   --target-args-json '[]' \
   --target-kwargs-json '{"batch_size":8}' \
   --output-dir ./runtime_profile \
-  --interval-ms 20
+  --interval-ms 20 \
+  --backend-order nvml_gpm,nvml_legacy,torch_cuda
 ```
 
-If your target function accepts the profiler object (for stage-level tracing), inject it:
+阶段级 trace：向目标函数注入 profiler，例如 `--inject-profiler-kwarg tracer`，在代码里 `with tracer.trace("prefill"): ...`。
 
-```bash
---inject-profiler-kwarg tracer
-```
+## 离线精剖（路线 B）
 
-Example target signature:
+- **Nsight Compute**：`offline/ncu_runner.py`、`offline/ncu_parser.py`；配置见 `NCUConfig` / `RuntimeProfilerConfig.ncu`。预设：`bound_basic`、`stall_debug`、`roofline`。  
+- **CUPTI**：`offline/cupti_runner.py`、`offline/cupti_range_bridge.py` 为预留接口，第一版未完全打通。
 
-```python
-def run_inference(..., tracer=None):
-    if tracer is not None:
-        with tracer.trace("load_model"):
-            ...
-        with tracer.trace("forward"):
-            ...
-```
+## 实现优先级对照
 
-### 2) Python API
+- **P0**：NvmlGpmBackend（与 legacy 组合的在线后端）、采样 schema、六面板主图、事件聚合、含 `pcie_io_bound` 的分类逻辑 — **已落地**。  
+- **P1**：ncu runner/parser、kernel drilldown、合并诊断 — **框架与解析已接好；完整 ncu 工作流依赖本机 `ncu` 与驱动**。  
+- **P2**：CUPTI 打通、roofline 专用图、更细 stall/PC — **接口预留**。
 
-```python
-from runtime_profiler import RuntimeProfiler, RuntimeProfilerConfig
-
-def target_fn():
-    ...
-
-profiler = RuntimeProfiler(
-    RuntimeProfilerConfig(
-        output_dir="./runtime_profile",
-        sample_interval_ms=20,
-        gpu_index=0,
-    )
-)
-result = profiler.run(target_fn)
-```
-
-## Output Artifacts
-
-- `profile_samples.csv`: sampled GPU metrics over time
-- `profile_events.json`: traced function event windows
-- `profile_summary.json`: peaks, peak locations, bound classification
-- `profile_timeline.png`: timeline with shared x-axis (utilization+memory, bandwidth, and optional torch-op density panel)
-- `profile_events_timeline.png`: event Gantt timeline (if matplotlib is available)
-- `torch_profiler_ops.csv` (optional): top-k operator-level time/memory metrics
-- `torch_profiler_trace.json` (optional): Chrome trace from `torch.profiler`
-
-## Project Layout
+## 项目布局
 
 ```text
 runtime_profiler/
-  __init__.py
   core.py
   metrics_backends.py
   event_tracer.py
+  event_aggregate.py
   classifiers.py
   plotter.py
-  adapters/
-    __init__.py
-    function_adapter.py
-    pytorch_adapter.py
-  utils/
-    __init__.py
-    loader.py
-    parsing.py
-    report.py
-  scripts/
-    __init__.py
-    profile_any_model.py
-    template_target.py
-  examples/
-    profile_cropformer_mask_demo.py
-    profile_toy_models.py
+  merge_diagnosis.py
+  offline/
+    ncu_runner.py
+    ncu_parser.py
+    cupti_runner.py
+    cupti_range_bridge.py
+  adapters/ ...
+  utils/ ...
+  scripts/ ...
+  examples/ ...
 ```
 
-## CLI Reference (`scripts/profile_any_model.py`)
+## 依赖说明
 
-- `--target-module` (required): module path containing the target callable
-- `--target-fn` (required): callable name inside the module
-- `--pythonpath`: prepend this path to `sys.path` before loading module
-- `--target-args-json`: JSON list for positional args
-- `--target-kwargs-json`: JSON object for keyword args
-- `--inject-profiler-kwarg`: inject profiler object into kwargs with this key
-- `--output-dir`: output directory for artifacts
-- `--interval-ms`: sampling interval in milliseconds
-- `--gpu-index`: GPU index for sampling
-- `--backend-order`: backend preference, e.g. `nvml,torch_cuda`
-- `--enable-torch-profiler`: enable operator-level torch profiler export
-- `--torch-profiler-record-shapes`: include shapes in torch profiler
-- `--no-torch-profiler-memory`: disable memory profiling in torch profiler
-- `--torch-profiler-with-stack`: include python stack in torch profiler
-- `--torch-profiler-with-flops`: include FLOPs estimate when available
-- `--no-torch-profiler-trace`: disable Chrome trace export
-- `--torch-profiler-topk-ops`: keep top-k ops in `torch_profiler_ops.csv`
-
-## Included Examples
-
-- `examples/profile_toy_models.py`: tiny CNN/Transformer/functional workloads
-- `examples/profile_cropformer_mask_demo.py`: CropFormer integration example
-
-For CropFormer example:
-
-```bash
-python runtime_profiler/examples/profile_cropformer_mask_demo.py \
-  --cropformer-root /path/to/CropFormer \
-  --output-dir ./runtime_profile_cropformer
-```
-
-## Notes
-
-- If NVML is unavailable, the profiler falls back to `torch_cuda`; some metrics become proxies.
-- Bandwidth metrics:
-  - `bandwidth_gbps` / `bandwidth_total_gbps`: total throughput (`TX + RX`)
-  - `bandwidth_tx_gbps`: PCIe TX throughput
-  - `bandwidth_rx_gbps`: PCIe RX throughput
-  - If PCIe counters are unavailable, profiler falls back to an estimated HBM/GDDR proxy (`mem_util * peak theoretical bandwidth`) for total only.
-- When `--enable-torch-profiler` is enabled, summary includes an optional timeline proxy from the trace:
-  - `cuda_active_ratio`: CUDA kernel active-time density (compute occupancy proxy, not hardware SM occupancy counter)
-  - `cuda_mem_event_mb_per_s`: memory-event traffic intensity parsed from trace events
-- Classification quality improves with richer backend metrics and stable workloads.
-- For kernel-level analysis, integrate with lower-level profilers separately (e.g., CUPTI/Nsight).
+- **NVML**：`pynvml` 或 `nvidia-ml-py`；GPM API 随驱动/绑定版本变化，不可用时自动退化为 legacy + torch。  
+- **Torch**：无 NVML 时仅能做 allocator 与有限结论（低置信度）。  
+- **matplotlib / numpy**：用于出图（可选）。
