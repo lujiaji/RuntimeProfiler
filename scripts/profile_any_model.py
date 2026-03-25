@@ -68,6 +68,42 @@ def build_parser() -> argparse.ArgumentParser:
         default="nvml,torch_cuda",
         help="Comma separated backend preference, e.g. nvml,torch_cuda",
     )
+    parser.add_argument(
+        "--enable-torch-profiler",
+        action="store_true",
+        help="Enable optional torch.profiler export (op-level time/memory)",
+    )
+    parser.add_argument(
+        "--torch-profiler-record-shapes",
+        action="store_true",
+        help="Record tensor shapes in torch.profiler",
+    )
+    parser.add_argument(
+        "--no-torch-profiler-memory",
+        action="store_true",
+        help="Disable memory profiling in torch.profiler",
+    )
+    parser.add_argument(
+        "--torch-profiler-with-stack",
+        action="store_true",
+        help="Enable stack capture in torch.profiler",
+    )
+    parser.add_argument(
+        "--torch-profiler-with-flops",
+        action="store_true",
+        help="Enable flops estimation in torch.profiler (if supported)",
+    )
+    parser.add_argument(
+        "--no-torch-profiler-trace",
+        action="store_true",
+        help="Disable chrome trace export from torch.profiler",
+    )
+    parser.add_argument(
+        "--torch-profiler-topk-ops",
+        type=int,
+        default=200,
+        help="How many top ops to keep in torch_profiler_ops.csv",
+    )
     return parser
 
 
@@ -89,6 +125,13 @@ def main() -> None:
             sample_interval_ms=args.interval_ms,
             gpu_index=args.gpu_index,
             backend_preference=backend_order,
+            enable_torch_profiler=args.enable_torch_profiler,
+            torch_profiler_record_shapes=args.torch_profiler_record_shapes,
+            torch_profiler_profile_memory=not args.no_torch_profiler_memory,
+            torch_profiler_with_stack=args.torch_profiler_with_stack,
+            torch_profiler_with_flops=args.torch_profiler_with_flops,
+            torch_profiler_export_chrome_trace=not args.no_torch_profiler_trace,
+            torch_profiler_topk_ops=args.torch_profiler_topk_ops,
         )
     )
     if args.inject_profiler_kwarg:

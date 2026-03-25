@@ -23,9 +23,11 @@ print(result.summary["bound_classification"])
 
 - Model-agnostic profiling via `profiler.run(target_fn, *args, **kwargs)`
 - Time-series GPU sampling (NVML first, Torch CUDA fallback)
+- Runtime bandwidth sampling (`bandwidth_total/tx/rx` from NVML PCIe throughput; fallback keeps total only via memory-bandwidth proxy)
 - Function-level event tracing (`trace` context manager and decorator)
 - Peak attribution (maps peak timestamps to innermost active function)
 - Bound classification (`compute_bound` / `memory_bound` / `mixed_bound`)
+- Optional `torch.profiler` export for op-level CUDA time / memory statistics
 - Export to CSV/JSON and timeline plots
 
 ## Quick Start
@@ -85,8 +87,10 @@ result = profiler.run(target_fn)
 - `profile_samples.csv`: sampled GPU metrics over time
 - `profile_events.json`: traced function event windows
 - `profile_summary.json`: peaks, peak locations, bound classification
-- `profile_timeline.png`: utilization/memory timeline (if matplotlib is available)
+- `profile_timeline.png`: timeline with shared x-axis (utilization+memory, bandwidth, and optional torch-op density panel)
 - `profile_events_timeline.png`: event Gantt timeline (if matplotlib is available)
+- `torch_profiler_ops.csv` (optional): top-k operator-level time/memory metrics
+- `torch_profiler_trace.json` (optional): Chrome trace from `torch.profiler`
 
 ## Project Layout
 
@@ -128,6 +132,13 @@ runtime_profiler/
 - `--interval-ms`: sampling interval in milliseconds
 - `--gpu-index`: GPU index for sampling
 - `--backend-order`: backend preference, e.g. `nvml,torch_cuda`
+- `--enable-torch-profiler`: enable operator-level torch profiler export
+- `--torch-profiler-record-shapes`: include shapes in torch profiler
+- `--no-torch-profiler-memory`: disable memory profiling in torch profiler
+- `--torch-profiler-with-stack`: include python stack in torch profiler
+- `--torch-profiler-with-flops`: include FLOPs estimate when available
+- `--no-torch-profiler-trace`: disable Chrome trace export
+- `--torch-profiler-topk-ops`: keep top-k ops in `torch_profiler_ops.csv`
 
 ## Included Examples
 
@@ -145,5 +156,13 @@ python runtime_profiler/examples/profile_cropformer_mask_demo.py \
 ## Notes
 
 - If NVML is unavailable, the profiler falls back to `torch_cuda`; some metrics become proxies.
+- Bandwidth metrics:
+  - `bandwidth_gbps` / `bandwidth_total_gbps`: total throughput (`TX + RX`)
+  - `bandwidth_tx_gbps`: PCIe TX throughput
+  - `bandwidth_rx_gbps`: PCIe RX throughput
+  - If PCIe counters are unavailable, profiler falls back to an estimated HBM/GDDR proxy (`mem_util * peak theoretical bandwidth`) for total only.
+- When `--enable-torch-profiler` is enabled, summary includes an optional timeline proxy from the trace:
+  - `cuda_active_ratio`: CUDA kernel active-time density (compute occupancy proxy, not hardware SM occupancy counter)
+  - `cuda_mem_event_mb_per_s`: memory-event traffic intensity parsed from trace events
 - Classification quality improves with richer backend metrics and stable workloads.
 - For kernel-level analysis, integrate with lower-level profilers separately (e.g., CUPTI/Nsight).
