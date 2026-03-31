@@ -15,15 +15,17 @@ from .event_aggregate import (
 )
 from .event_tracer import EventTracer, TraceEvent
 from .merge_diagnosis import merge_online_offline
-from .metrics_backends import GpuSample, MetricsBackend, build_backend
+from .metrics_backends import GpuSample, MetricsBackend, build_backend, resolve_torch_device_index
 from .offline.ncu_parser import parse_ncu_csv_to_kernels, write_kernel_artifacts
 from .offline.ncu_runner import NCUConfig, run_ncu
 from .plotter import (
+    export_memory_breakdown_csv,
     plot_bound_evidence_heatmap,
     plot_event_summary_bars,
     plot_event_timeline,
     plot_kernel_drilldown,
     plot_main_figure,
+    plot_memory_breakdown,
 )
 
 
@@ -118,9 +120,10 @@ class RuntimeProfiler:
         try:
             import torch
 
-            if not torch.cuda.is_available() or torch.cuda.device_count() <= self.config.gpu_index:
+            logical_idx = resolve_torch_device_index(self.config.gpu_index)
+            if logical_idx is None:
                 return sample
-            device = torch.device(f"cuda:{self.config.gpu_index}")
+            device = torch.device(f"cuda:{logical_idx}")
             with torch.cuda.device(device):
                 allocated = torch.cuda.memory_allocated(device) / (1024.0 * 1024.0)
                 reserved = torch.cuda.memory_reserved(device) / (1024.0 * 1024.0)
@@ -588,6 +591,9 @@ class RuntimeProfiler:
                 plot_bound_evidence_heatmap(rollup_objs, str(out / "profile_event_heatmap.png"))
             if kernel_rows:
                 plot_kernel_drilldown(kernel_rows, str(out / "kernel_drilldown.png"))
+            mem_ts0 = samples[0].ts_ns if samples else 0
+            plot_memory_breakdown(events, mem_ts0, str(out / "memory_breakdown.png"))
+            export_memory_breakdown_csv(events, mem_ts0, str(out / "memory_breakdown.csv"))
 
         merged_path = out / "merged_diagnosis_report.json"
         with merged_path.open("w", encoding="utf-8") as f:

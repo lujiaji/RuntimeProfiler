@@ -10,6 +10,7 @@ Resource domains:
 from __future__ import annotations
 
 import time
+import os
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -123,6 +124,38 @@ class MetricsBackend:
 
     def sample(self) -> GpuSample:
         raise NotImplementedError
+
+
+def resolve_torch_device_index(requested_index: int) -> Optional[int]:
+    """
+    Resolve profiler GPU index to torch logical cuda index.
+
+    RuntimeProfiler often uses physical indices for NVML (`--gpu-index`), while torch
+    APIs use process-local logical indices after `CUDA_VISIBLE_DEVICES` remapping.
+    """
+    if not torch.cuda.is_available():
+        return None
+    count = int(torch.cuda.device_count())
+    if count <= 0:
+        return None
+
+    # Direct logical index path.
+    if 0 <= int(requested_index) < count:
+        return int(requested_index)
+
+    # Physical index to logical index remap via CUDA_VISIBLE_DEVICES.
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if cvd:
+        tokens = [t.strip() for t in cvd.split(",") if t.strip()]
+        req = str(int(requested_index))
+        for logical_idx, token in enumerate(tokens):
+            if token == req and logical_idx < count:
+                return logical_idx
+
+    # Common single-GPU-visible case: map any requested index to logical 0.
+    if count == 1:
+        return 0
+    return None
 
 
 def _kb_s_to_mib_s(kb_s: float) -> float:
@@ -561,10 +594,10 @@ class TorchCudaBackend(MetricsBackend):
 
     def __init__(self, gpu_index: int = 0) -> None:
         self._gpu_index = gpu_index
-        self._device = torch.device(f"cuda:{gpu_index}")
+        self._device = torch.device("cuda:0")
 
     def available(self) -> bool:
-        return torch.cuda.is_available() and torch.cuda.device_count() > self._gpu_index
+        return resolve_torch_device_index(self._gpu_index) is not None
 
     def capabilities(self) -> Dict[str, Any]:
         caps = super().capabilities()
@@ -580,11 +613,15 @@ class TorchCudaBackend(MetricsBackend):
     def sample(self) -> GpuSample:
         if not self.available():
             raise RuntimeError("CUDA is unavailable")
+        logical_idx = resolve_torch_device_index(self._gpu_index)
+        if logical_idx is None:
+            raise RuntimeError("Unable to map requested GPU index to torch logical device")
+        device = torch.device(f"cuda:{logical_idx}")
         now_ns = time.perf_counter_ns()
-        with torch.cuda.device(self._device):
-            mem_allocated = torch.cuda.memory_allocated(self._device)
-            mem_reserved = torch.cuda.memory_reserved(self._device)
-            total_mem = torch.cuda.get_device_properties(self._device).total_memory
+        with torch.cuda.device(device):
+            mem_allocated = torch.cuda.memory_allocated(device)
+            mem_reserved = torch.cuda.memory_reserved(device)
+            total_mem = torch.cuda.get_device_properties(device).total_memory
         allocated_mb = mem_allocated / (1024.0 * 1024.0)
         reserved_mb = mem_reserved / (1024.0 * 1024.0)
         total_mb = total_mem / (1024.0 * 1024.0)

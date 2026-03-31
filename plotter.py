@@ -46,6 +46,47 @@ def _series_peak(xs: List[float], ys: List[Optional[float]]) -> Optional[Tuple[f
     return best
 
 
+def _extract_memory_markers(events: Sequence[TraceEvent], ts0: int) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for ev in events:
+        meta = ev.metadata if isinstance(ev.metadata, dict) else None
+        if not meta:
+            continue
+        if str(meta.get("marker_type", "")).lower() != "memory":
+            continue
+        marker_ts_ns = meta.get("marker_ts_ns")
+        if marker_ts_ns is not None:
+            try:
+                t_s = (int(marker_ts_ns) - ts0) / 1e9
+            except Exception:
+                t_s = (ev.end_ns - ts0) / 1e9
+        else:
+            t_s = (ev.end_ns - ts0) / 1e9
+        val = meta.get("value_mb")
+        try:
+            value_mb = float(val) if val is not None else None
+        except Exception:
+            value_mb = None
+        if value_mb is None:
+            # Fallback to reserved as a visible proxy when explicit value is absent.
+            rv = meta.get("reserved_mem_mb")
+            try:
+                value_mb = float(rv) if rv is not None else None
+            except Exception:
+                value_mb = None
+        out.append(
+            {
+                "t_s": t_s,
+                "value_mb": value_mb,
+                "label": str(meta.get("label") or meta.get("marker_name") or ev.name),
+                "component": str(meta.get("component") or "memory"),
+                "is_peak": bool(meta.get("is_peak", False)),
+                "point": str(meta.get("point") or ""),
+            }
+        )
+    return out
+
+
 def plot_main_figure(
     samples: List[GpuSample],
     events: List[TraceEvent],
@@ -213,6 +254,38 @@ def plot_main_figure(
         ax3.axhline(y=float(tot), linestyle="--", linewidth=1.0, label="total_mem_mb", alpha=0.6)
     if detail_mode and _any_values([s.active_mem_mb for s in samples]):
         ax3.plot(xs, [s.active_mem_mb for s in samples], label="active_mem_mb", alpha=0.7)
+    memory_markers = _extract_memory_markers(events, ts0)
+    _MARKER_COLORS = {
+        "weights": "tab:purple",
+        "activation": "tab:red",
+        "kv_cache": "tab:green",
+        "custom": "tab:orange",
+    }
+    if memory_markers:
+        shown_labels: Dict[str, bool] = {}
+        for mk in memory_markers:
+            comp = mk["component"]
+            show = mk.get("is_peak") or comp in ("weights", "custom")
+            if not show:
+                continue
+            x, y = mk["t_s"], mk["value_mb"]
+            if y is None:
+                continue
+            c = _MARKER_COLORS.get(comp, "tab:gray")
+            leg = f"{comp}" if comp not in shown_labels else None
+            shown_labels[comp] = True
+            ax3.axvline(x=x, linestyle=":", linewidth=0.8, color=c, alpha=0.3)
+            ax3.scatter([x], [y], color=c, marker="D", s=36, zorder=6, label=leg)
+            txt = mk["label"][:20]
+            ax3.annotate(
+                f"{txt}\n{y:,.0f} MiB",
+                (x, y),
+                textcoords="offset points",
+                xytext=(5, 5),
+                fontsize=6.5,
+                color=c,
+                fontweight="bold",
+            )
     if ax3.get_legend_handles_labels()[0]:
         ax3.legend(loc="upper right", fontsize=7)
     ax3.grid(True, alpha=0.25)
@@ -415,3 +488,131 @@ def plot_event_timeline(events: List[TraceEvent], out_png: str) -> None:
 
 def samples_to_csv_rows(samples: List[GpuSample]) -> List[Dict[str, Any]]:
     return [s.to_dict() for s in samples]
+
+
+def _collect_step_rows(
+    events: Sequence[TraceEvent], ts0: int
+) -> List[Dict[str, Any]]:
+    """Extract per-step activation/kv rows from memory markers (component in activation/kv_cache)."""
+    markers = _extract_memory_markers(events, ts0)
+    act_by_ts: Dict[float, Dict[str, Any]] = {}
+    kv_by_ts: Dict[float, Dict[str, Any]] = {}
+    weights_mb: Optional[float] = None
+
+    for mk in markers:
+        comp = mk["component"]
+        if comp == "weights":
+            weights_mb = mk.get("value_mb")
+            continue
+        ts_key = round(mk["t_s"], 6)
+        if comp == "activation":
+            act_by_ts[ts_key] = mk
+        elif comp == "kv_cache":
+            kv_by_ts[ts_key] = mk
+
+    all_ts = sorted(set(act_by_ts.keys()) | set(kv_by_ts.keys()))
+    rows: List[Dict[str, Any]] = []
+    for ts in all_ts:
+        act = act_by_ts.get(ts) or {}
+        kv = kv_by_ts.get(ts) or {}
+        act_mb = float(act.get("value_mb") or 0.0)
+        kv_mb = float(kv.get("value_mb") or 0.0)
+        w_mb = float(weights_mb) if weights_mb is not None else 0.0
+        total_alloc = w_mb + act_mb + kv_mb
+        rows.append(
+            {
+                "time_s": ts,
+                "point": str(act.get("point") or kv.get("point") or ""),
+                "weights_mb": round(w_mb, 2),
+                "activation_mb": round(act_mb, 2),
+                "kv_cache_mb": round(kv_mb, 2),
+                "total_alloc_mb": round(total_alloc, 2),
+                "activation_pct": round(act_mb / total_alloc * 100, 2) if total_alloc > 0 else 0.0,
+                "kv_cache_pct": round(kv_mb / total_alloc * 100, 2) if total_alloc > 0 else 0.0,
+                "weights_pct": round(w_mb / total_alloc * 100, 2) if total_alloc > 0 else 0.0,
+            }
+        )
+    return rows
+
+
+def export_memory_breakdown_csv(
+    events: Sequence[TraceEvent], ts0: int, out_csv: str
+) -> None:
+    import csv as _csv
+
+    rows = _collect_step_rows(events, ts0)
+    if not rows:
+        return
+    fieldnames = list(rows[0].keys())
+    Path(out_csv).parent.mkdir(parents=True, exist_ok=True)
+    with open(out_csv, "w", newline="", encoding="utf-8") as f:
+        w = _csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+
+
+def plot_memory_breakdown(
+    events: Sequence[TraceEvent], ts0: int, out_png: str
+) -> None:
+    try:
+        import matplotlib.pyplot as plt
+    except Exception:
+        return
+
+    rows = _collect_step_rows(events, ts0)
+    if not rows:
+        return
+
+    xs = [r["time_s"] for r in rows]
+    act = [r["activation_mb"] for r in rows]
+    kv = [r["kv_cache_mb"] for r in rows]
+    act_pct = [r["activation_pct"] for r in rows]
+    kv_pct = [r["kv_cache_pct"] for r in rows]
+    w_pct = [r["weights_pct"] for r in rows]
+
+    fig, axes = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
+
+    ax_abs = axes[0]
+    ax_abs.fill_between(xs, 0, kv, alpha=0.45, color="tab:green", label="kv_cache")
+    ax_abs.fill_between(xs, kv, [k + a for k, a in zip(kv, act)], alpha=0.45, color="tab:red", label="activation")
+    ax_abs.plot(xs, kv, linewidth=0.8, color="tab:green")
+    ax_abs.plot(xs, [k + a for k, a in zip(kv, act)], linewidth=0.8, color="tab:red")
+
+    peak_act_idx = max(range(len(act)), key=lambda i: act[i])
+    peak_kv_idx = max(range(len(kv)), key=lambda i: kv[i])
+    ax_abs.scatter([xs[peak_act_idx]], [kv[peak_act_idx] + act[peak_act_idx]], color="tab:red", marker="D", s=40, zorder=5)
+    ax_abs.annotate(
+        f"act peak: {act[peak_act_idx]:,.0f} MiB",
+        (xs[peak_act_idx], kv[peak_act_idx] + act[peak_act_idx]),
+        textcoords="offset points", xytext=(5, 5), fontsize=7, color="tab:red", fontweight="bold",
+    )
+    ax_abs.scatter([xs[peak_kv_idx]], [kv[peak_kv_idx]], color="tab:green", marker="D", s=40, zorder=5)
+    ax_abs.annotate(
+        f"kv peak: {kv[peak_kv_idx]:,.0f} MiB",
+        (xs[peak_kv_idx], kv[peak_kv_idx]),
+        textcoords="offset points", xytext=(5, -12), fontsize=7, color="tab:green", fontweight="bold",
+    )
+    ax_abs.set_ylabel("MiB")
+    ax_abs.set_title("Runtime memory breakdown: activation vs KV cache (stacked)")
+    ax_abs.legend(loc="upper left", fontsize=8)
+    ax_abs.grid(True, alpha=0.2)
+
+    ax_pct = axes[1]
+    ax_pct.stackplot(
+        xs, w_pct, kv_pct, act_pct,
+        labels=["weights", "kv_cache", "activation"],
+        colors=["tab:purple", "tab:green", "tab:red"],
+        alpha=0.65,
+    )
+    ax_pct.set_ylabel("%")
+    ax_pct.set_xlabel("Time (s)")
+    ax_pct.set_title("Memory composition (%): weights / kv_cache / activation")
+    ax_pct.set_ylim(0, 100)
+    ax_pct.legend(loc="upper left", fontsize=8)
+    ax_pct.grid(True, alpha=0.2)
+
+    Path(out_png).parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=140)
+    plt.close(fig)

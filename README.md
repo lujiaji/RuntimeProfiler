@@ -87,6 +87,51 @@ python runtime_profiler/scripts/profile_any_model.py \
 
 阶段级 trace：向目标函数注入 profiler，例如 `--inject-profiler-kwarg tracer`，在代码里 `with tracer.trace("prefill"): ...`。
 
+## InfinityStar 显存打点（weight / activation / kv）
+
+当前在 `tools/infer_video_720p.py` + `infinity/models/infinity.py` 已接入以下显存打点并在 `profile_main_figure.png` 的 Capacity 面板显示：
+
+- `weights_loaded`（`component=weights`）：权重加载完成后的显存占用。
+- `activation_step` / `activation_max`（`component=activation`）：逐 step 的 activation-only 显存与峰值。
+- `kv_cache_step` / `kv_cache_max`（`component=kv_cache`）：逐 step 的 KV cache 显存与峰值。
+
+> 说明：`activation_step` 采用 `alloc - weight_baseline - kv_cache_live`，用于尽量反映 activation 本体占用。
+
+## 手动命名打点（自定义 marker）
+
+除了自动打点外，你可以在业务代码任意位置手动加点，并在图里显示你给的名字。
+
+### 一行 helper（推荐）
+
+`tools/infer_video_720p.py` 已提供短 helper：
+
+```python
+mark_mem(tracer, "after_load_encoder")
+mark_mem(tracer, "after_any_fn", component="custom")
+mark_mem(tracer, "my_peak", component="custom", value_mb=1234.5, is_peak=True)
+```
+
+- `name`：图里显示的点名。
+- `component`：`custom` / `weights` / `activation` / `kv_cache`。
+- `value_mb`：可选；不传时默认取当前 `alloc_mem_mb`。
+
+### 完整接口（可选）
+
+如果需要传更多字段，可用：
+
+```python
+emit_profile_memory_marker(
+    tracer,
+    marker_name="after_decode_block_3",
+    component="custom",
+    value_mb=some_value_mb,
+    scale_ind=3,
+    repeat_idx=1,
+)
+```
+
+只要运行是通过 RuntimeProfiler 注入 `tracer`（`--inject-profiler-kwarg tracer`），这些 marker 就会进入事件流并在主图中显示。
+
 ## 离线精剖（路线 B）
 
 - **Nsight Compute**：`offline/ncu_runner.py`、`offline/ncu_parser.py`；配置见 `NCUConfig` / `RuntimeProfilerConfig.ncu`。预设：`bound_basic`、`stall_debug`、`roofline`。  

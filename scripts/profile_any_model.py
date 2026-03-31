@@ -10,8 +10,8 @@ RUNTIME_PROFILER_ROOT = CURRENT_FILE.parents[1]
 PROJECT_PARENT = RUNTIME_PROFILER_ROOT.parent
 sys.path.insert(0, str(PROJECT_PARENT))
 
-from runtime_profiler import RuntimeProfiler, RuntimeProfilerConfig  # noqa: E402
-from runtime_profiler.utils import (  # noqa: E402
+from RuntimeProfiler import RuntimeProfiler, RuntimeProfilerConfig  # noqa: E402
+from RuntimeProfiler.utils import (  # noqa: E402
     load_callable_from_module,
     parse_json_list,
     parse_json_object,
